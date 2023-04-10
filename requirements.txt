@@ -1,0 +1,8 @@
+torch
+torchvision
+transformers
+einops
+pandas
+plotly
+nbformat>=4.2.0
+ipykernel
