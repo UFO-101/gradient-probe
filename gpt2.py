@@ -40,36 +40,44 @@ class GPT2Block(nn.Module):
         self.linear1 = nn.Linear(n_embd, 4*n_embd)
         self.linear2 = nn.Linear(4*n_embd, n_embd)
         self.mlp_act = nn.Identity()
+        self.input_resid = nn.Identity()
+        self.final_resid = nn.Identity()
 
-    def forward(self, x: t.Tensor) -> t.Tensor:
+    def forward(self, x: t.Tensor, patch_mlp_act=None) -> t.Tensor:
         """(batch, seq, n_embd) -> (batch, seq, n_embd)"""
+        x = self.input_resid(x)
         attn_out, attn = self.attn(self.ln1(x))
         mid = x + attn_out
         mlp_act = nn.functional.gelu(self.linear1(self.ln2(mid)), approximate="tanh")
+        mlp_act = mlp_act if patch_mlp_act is None else patch_mlp_act
         mlp_act = self.mlp_act(mlp_act)
         mlp_out = self.linear2(mlp_act)
-        return mid + mlp_out, attn, attn_out, mid, mlp_act, mlp_out
+        final_resid = self.final_resid(mid + mlp_out)
+        return final_resid, attn, attn_out, mid, mlp_act, mlp_out
 
 class GPT2(nn.Module):
     def __init__(self, vocab_size, max_pos, n_embd, n_layers, n_heads, ln_eps):
         super().__init__()
+        self.vocab_size, self.max_pos, self.n_embd, self.n_layers, self.n_heads, self.ln_eps = \
+            vocab_size, max_pos, n_embd, n_layers, n_heads, ln_eps
         self.tok_embed = nn.Embedding(vocab_size, n_embd)
         self.pos_embed = nn.Embedding(max_pos, n_embd)
         self.blocks = nn.Sequential(
             *[GPT2Block(n_embd, n_heads, ln_eps) for _ in range(n_layers)])
         self.final_ln = nn.LayerNorm((n_embd), ln_eps)
 
-    def forward(self, x: t.Tensor, embed: bool = True) -> t.Tensor:
+    def forward(self, x:t.Tensor, in_lyr:int=0, pos_embd=True, mlp_act_lyr=None, mlp_act=None) -> t.Tensor:
         """(batch, seq, [embed]), int64 -> (batch, seq, vocab_size), float32"""
         pos_vector = t.stack([t.arange(x.shape[1]) for _ in range(x.shape[0])])
-        x = (self.tok_embed(x) if embed else x) + self.pos_embed(pos_vector)
+        x = self.tok_embed(x) if x.ndim==2 else x
+        x = (x + self.pos_embed(pos_vector)) if pos_embd else x
         act_lists = [[x], [], [], [], [], []]
-        for block in self.blocks:
-            block_outs = block(x)
+        for i, block in enumerate(self.blocks[in_lyr:]):
+            block_outs = block(x, mlp_act if i == mlp_act_lyr else None)
             x = block_outs[0]
             [l.append(o) for l, o in zip(act_lists, block_outs)]
         x = self.final_ln(x)
-        acts = [t.stack(l) for l in act_lists]
+        acts = [t.stack(l) for l in act_lists if len(l) > 0]
         return einsum(x, self.tok_embed.weight, "b s e, v e -> b s v"), acts
 
 def _copy_weight_bias(mine, theirs, T=False):
@@ -110,12 +118,12 @@ def load_pretrained_gpt2(name: str = "gpt2", device: str = "cpu"):
 #%%
 # Test implementation matches HuggingFace
 if __name__ == "__main__":
-    model_name = "gpt2"
+    model_name = "gpt2-medium"
     my_gpt, my_tknizr = load_pretrained_gpt2(model_name)
     hf_tknizr = AutoTokenizer.from_pretrained(model_name)
     hf_gpt2 = AutoModelForCausalLM.from_pretrained(model_name)
     encode = lambda text: hf_tknizr(text, return_tensors="pt")["input_ids"]
-    tokens = encode("Former President of the United States of America, George")
+    tokens = encode("I like to visit the Colosseum when I go to")
     with t.inference_mode():
         logits, hf_logits = my_gpt(tokens)[0][0, -1], hf_gpt2(tokens)[0][0, -1]
     topk, hf_topk = t.topk(logits, k=10), t.topk(hf_logits, k=10)

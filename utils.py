@@ -1,12 +1,17 @@
+#%%
 import torch as t
 import torchvision
 import math
 import plotly.express as px
 
-def tokenize(text: str, tknizr, prepend_bos=False) -> t.Tensor:
-    toks = tknizr(text, return_tensors="pt")["input_ids"]
-    bos = t.full((1, 1), tknizr.bos_token_id, dtype=toks.dtype)
-    return t.cat((bos, toks), dim=-1) if prepend_bos else toks
+def tokenize(text: str, tknizr, prepend_bos:bool=False, device=None) -> t.Tensor:
+    tknizr.pad_token = tknizr.bos_token
+    toks = tknizr(text, return_tensors="pt", padding=True)["input_ids"]
+    masks = tknizr(text, return_tensors="pt", padding=True)["attention_mask"]
+    bos = t.full((toks.shape[0], 1), tknizr.bos_token_id, dtype=toks.dtype)
+    toks = t.cat((bos, toks), dim=-1) if prepend_bos else toks
+    final_tok_index = t.sum(masks, dim=-1) if prepend_bos else t.sum(masks, dim=-1) - 1
+    return toks.to(device) if device else toks, final_tok_index
 
 def tokenize_txt(text: str, tknizr, prepend_bos=False) -> t.Tensor:
     txt = tknizr.tokenize(text)
@@ -16,16 +21,18 @@ def print_preds(logits: t.Tensor, tokenizer, topk=5):
     assert logits.shape[0] == 1
     topk = t.topk(logits[0, -1], k=topk)
     for i in range(topk.indices.shape[0]):
-        print(topk.indices[i], tokenizer.decode(topk.indices[i]), topk.values[i])
+        print(topk.indices[i].item(), tokenizer.decode(topk.indices[i]),
+              "%.3f" % topk.values[i].item())
 
-def logit(token, logits, tokenizer):
-    logits = logits.squeeze()
+def logit(token, logits, tokenizer, final_tok_idx=-1):
+    # logits = logits.squeeze()
     if isinstance(token, str):
         token = tokenizer.encode(token)
-    return logits[-1, token]
+    return logits[range(logits.shape[0]), final_tok_idx, token]
 
-def logit_diff(token1, token2, logits, tokenizer):
-    return logit(token1, logits, tokenizer) - logit(token2, logits, tokenizer)
+def logit_diff(token1, token2, logits, tokenizer, final_tok_idx=-1):
+    return logit(token1, logits, tokenizer, final_tok_idx) \
+            - logit(token2, logits, tokenizer, final_tok_idx)
 
 def custom_make_grid(tensor, border=0):
     nrow = math.floor(math.sqrt(tensor.shape[0]))
@@ -34,29 +41,29 @@ def custom_make_grid(tensor, border=0):
     tensor = torchvision.utils.make_grid(tensor, nrow, 1, pad_value=border)
     return tensor[..., 0, :, :], height + 1, width + 1, nrow
 
-def leq_4d_to_grid(tensor):
+def leq_4d_to_grid(tensor, bord=0):
     assert len(tensor.shape) <= 4
-    layers, border = [], t.min(tensor).item()
+    layers, border = [], t.min(tensor).item() - bord
     for i in range(tensor.shape[0]):
         grid, _, _, _ = custom_make_grid(tensor[i], border=border)
         layers.append(grid)
     return custom_make_grid(t.stack(layers), border=border)
 
-def display_tensor_grid(activations, title=None, animate=False, prompt=None):
+def display_tensor_grid(activations, title=None, animate=False, prompt=None, bord=0):
     print('displaying tensor grid:', activations.shape)
     activations = activations.detach().clone().squeeze()
     assert len(activations.shape) <= 4 or (len(activations.shape) == 5 and animate)
     if animate:
         layers = []
         for i in range(activations.shape[0]):
-            grid, h, w, nrow = leq_4d_to_grid(activations[i])
+            grid, h, w, nrow = leq_4d_to_grid(activations[i], bord=bord)
             layers.append(grid)
         grid_h, grid_w = grid.shape[0], grid.shape[1]
         grid = t.stack(layers)
         fig = px.imshow(grid.cpu().numpy(), animation_frame=0, height=800, title=title,
                         labels={"x": "Source", "y": "Destination", "color": "Weight"})
     else:
-        grid, h, w, nrow = leq_4d_to_grid(activations)
+        grid, h, w, nrow = leq_4d_to_grid(activations, bord=bord)
         grid_h, grid_w = grid.shape[0], grid.shape[1]
         fig = px.imshow(grid.cpu().numpy(), height=800, title=title,
                         labels={"x": "Source", "y": "Destination", "color": "Weight"})
